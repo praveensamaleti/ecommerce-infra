@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
-  ecommerce-infra | Stack 1/3 — Networking
+  ecommerce-infra | Stack 1/3 -- Networking
   Creates VPC, public/private subnets, Internet Gateway, route tables,
   security groups (ALB, backend ECS, frontend ECS, RDS, ElastiCache),
   CloudWatch log groups, and IAM roles for ECS task execution and task role.
@@ -30,25 +30,25 @@ Parameters:
   PublicSubnet1CIDR:
     Type: String
     Default: '10.0.1.0/24'
-    Description: Public subnet AZ1 — ECS Fargate tasks + ALB nodes.
+    Description: Public subnet AZ1 -- ECS Fargate tasks + ALB nodes.
 
   PublicSubnet2CIDR:
     Type: String
     Default: '10.0.2.0/24'
-    Description: Public subnet AZ2 — ECS Fargate tasks + ALB nodes (HA).
+    Description: Public subnet AZ2 -- ECS Fargate tasks + ALB nodes (HA).
 
   PrivateSubnet1CIDR:
     Type: String
     Default: '10.0.3.0/24'
-    Description: Private subnet AZ1 — RDS and ElastiCache (no internet route).
+    Description: Private subnet AZ1 -- RDS and ElastiCache (no internet route).
 
   PrivateSubnet2CIDR:
     Type: String
     Default: '10.0.4.0/24'
-    Description: Private subnet AZ2 — RDS subnet group requires 2 AZs.
+    Description: Private subnet AZ2 -- RDS subnet group requires 2 AZs.
 
 # ============================================================================
-# Metadata — groups parameters in the CloudFormation console
+# Metadata -- groups parameters in the CloudFormation console
 # ============================================================================
 Metadata:
   AWS::CloudFormation::Interface:
@@ -99,7 +99,7 @@ Resources:
           Value: !Ref EnvironmentName
 
   # --------------------------------------------------------------------------
-  # Internet Gateway — gives public subnets a route to the internet.
+  # Internet Gateway -- gives public subnets a route to the internet.
   # ECS Fargate tasks in public subnets use this to reach ECR and Secrets Manager.
   # No NAT Gateway needed (saves ~$32/month per AZ).
   # --------------------------------------------------------------------------
@@ -120,7 +120,7 @@ Resources:
   # Subnets
   # Public  (AZ1 + AZ2): ECS Fargate tasks + ALB. MapPublicIpOnLaunch=true
   #   so Fargate ENIs get public IPs to reach ECR/Secrets Manager without NAT.
-  # Private (AZ1 + AZ2): RDS + ElastiCache — isolated, no internet route.
+  # Private (AZ1 + AZ2): RDS + ElastiCache -- isolated, no internet route.
   # --------------------------------------------------------------------------
   PublicSubnet1:
     Type: AWS::EC2::Subnet
@@ -178,7 +178,7 @@ Resources:
   # Route Tables
   # --------------------------------------------------------------------------
 
-  # Public route table — has a default route to the Internet Gateway
+  # Public route table -- has a default route to the Internet Gateway
   PublicRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -207,7 +207,7 @@ Resources:
       SubnetId: !Ref PublicSubnet2
       RouteTableId: !Ref PublicRouteTable
 
-  # Private route table — NO default route. RDS and ElastiCache are isolated.
+  # Private route table -- NO default route. RDS and ElastiCache are isolated.
   PrivateRouteTable:
     Type: AWS::EC2::RouteTable
     Properties:
@@ -232,11 +232,11 @@ Resources:
   # Security Groups
   #
   # Traffic flow:
-  #   Internet → ALBSecurityGroup (80/443)
-  #            → BackendECSSecurityGroup (8080, from ALB)
-  #            → FrontendECSSecurityGroup (80, from ALB)
-  #   BackendECSSecurityGroup → RDSSecurityGroup (5432)
-  #   BackendECSSecurityGroup → ElastiCacheSecurityGroup (6379)
+  #   Internet -> ALBSecurityGroup (80/443)
+  #            -> BackendECSSecurityGroup (8080, from ALB)
+  #            -> FrontendECSSecurityGroup (80, from ALB)
+  #   BackendECSSecurityGroup -> RDSSecurityGroup (5432)
+  #   BackendECSSecurityGroup -> ElastiCacheSecurityGroup (6379)
   # --------------------------------------------------------------------------
 
   # ALB: accepts public HTTP/HTTPS traffic, forwards to ECS containers
@@ -257,7 +257,7 @@ Resources:
           FromPort: 443
           ToPort: 443
           CidrIp: '0.0.0.0/0'
-      # Egress: allow all — ALB must forward to ECS task IPs on any port
+      # Egress: allow all -- ALB must forward to ECS task IPs on any port
       Tags:
         - Key: Name
           Value: !Sub '${EnvironmentName}-alb-sg'
@@ -275,7 +275,7 @@ Resources:
           FromPort: 8080
           ToPort: 8080
           SourceSecurityGroupId: !Ref ALBSecurityGroup
-      # Egress: all — Fargate pulls ECR images (443) + reaches RDS + Redis + Secrets Manager
+      # Egress: all -- Fargate pulls ECR images (443) + reaches RDS + Redis + Secrets Manager
       Tags:
         - Key: Name
           Value: !Sub '${EnvironmentName}-backend-ecs-sg'
@@ -293,7 +293,7 @@ Resources:
           FromPort: 80
           ToPort: 80
           SourceSecurityGroupId: !Ref ALBSecurityGroup
-      # Egress: all — Fargate needs ECR image pull (443)
+      # Egress: all -- Fargate needs ECR image pull (443)
       Tags:
         - Key: Name
           Value: !Sub '${EnvironmentName}-frontend-ecs-sg'
@@ -357,10 +357,10 @@ Resources:
   # IAM Roles
   # --------------------------------------------------------------------------
 
-  # ECSTaskExecutionRole — assumed by the ECS AGENT (not the app) to:
-  #   • Pull container images from ECR
-  #   • Write logs to CloudWatch
-  #   • Retrieve secrets from Secrets Manager at task startup
+  # ECSTaskExecutionRole -- assumed by the ECS AGENT (not the app) to:
+  #   - Pull container images from ECR
+  #   - Write logs to CloudWatch
+  #   - Retrieve secrets from Secrets Manager at task startup
   ECSTaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -391,7 +391,7 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-ecs-exec-role'
 
-  # ECSTaskRole — assumed by the RUNNING APPLICATION CONTAINER to make
+  # ECSTaskRole -- assumed by the RUNNING APPLICATION CONTAINER to make
   # AWS API calls at runtime (e.g. CloudWatch metrics, S3 access if needed).
   # Currently grants CloudWatch Logs write for the app's own log streams.
   ECSTaskRole:
@@ -424,7 +424,7 @@ Resources:
           Value: !Sub '${EnvironmentName}-ecs-task-role'
 
 # ============================================================================
-# Outputs — exported for cross-stack references by 02-data and 03-compute
+# Outputs -- exported for cross-stack references by 02-data and 03-compute
 # ============================================================================
 Outputs:
 
