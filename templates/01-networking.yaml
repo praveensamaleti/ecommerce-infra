@@ -1,0 +1,539 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ecommerce-infra | Stack 1/3 — Networking
+  Creates VPC, public/private subnets, Internet Gateway, route tables,
+  security groups (ALB, backend ECS, frontend ECS, RDS, ElastiCache),
+  CloudWatch log groups, and IAM roles for ECS task execution and task role.
+  All resource names are prefixed with EnvironmentName for uniqueness.
+
+# ============================================================================
+# Parameters
+# ============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: ecommerce-demo
+    Description: >
+      Prefix applied to every resource name. Change this value per deployment
+      to keep resource names unique. Use lowercase alphanumeric and hyphens only.
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Lowercase alphanumeric characters and hyphens only.
+    MinLength: 3
+    MaxLength: 30
+
+  VpcCIDR:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block for the VPC.
+
+  PublicSubnet1CIDR:
+    Type: String
+    Default: '10.0.1.0/24'
+    Description: Public subnet AZ1 — ECS Fargate tasks + ALB nodes.
+
+  PublicSubnet2CIDR:
+    Type: String
+    Default: '10.0.2.0/24'
+    Description: Public subnet AZ2 — ECS Fargate tasks + ALB nodes (HA).
+
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: '10.0.3.0/24'
+    Description: Private subnet AZ1 — RDS and ElastiCache (no internet route).
+
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: '10.0.4.0/24'
+    Description: Private subnet AZ2 — RDS subnet group requires 2 AZs.
+
+# ============================================================================
+# Metadata — groups parameters in the CloudFormation console
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment"
+        Parameters: [EnvironmentName]
+      - Label:
+          default: "Network CIDR Blocks"
+        Parameters:
+          - VpcCIDR
+          - PublicSubnet1CIDR
+          - PublicSubnet2CIDR
+          - PrivateSubnet1CIDR
+          - PrivateSubnet2CIDR
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment / Stack Prefix"
+      VpcCIDR:
+        default: "VPC CIDR"
+      PublicSubnet1CIDR:
+        default: "Public Subnet 1 CIDR (AZ1)"
+      PublicSubnet2CIDR:
+        default: "Public Subnet 2 CIDR (AZ2)"
+      PrivateSubnet1CIDR:
+        default: "Private Subnet 1 CIDR (AZ1)"
+      PrivateSubnet2CIDR:
+        default: "Private Subnet 2 CIDR (AZ2)"
+
+# ============================================================================
+# Resources
+# ============================================================================
+Resources:
+
+  # --------------------------------------------------------------------------
+  # VPC
+  # --------------------------------------------------------------------------
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsSupport: true       # Required: ECS tasks resolve ECR/RDS hostnames
+      EnableDnsHostnames: true     # Required: RDS endpoint hostname resolution
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-vpc'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # --------------------------------------------------------------------------
+  # Internet Gateway — gives public subnets a route to the internet.
+  # ECS Fargate tasks in public subnets use this to reach ECR and Secrets Manager.
+  # No NAT Gateway needed (saves ~$32/month per AZ).
+  # --------------------------------------------------------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-igw'
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # --------------------------------------------------------------------------
+  # Subnets
+  # Public  (AZ1 + AZ2): ECS Fargate tasks + ALB. MapPublicIpOnLaunch=true
+  #   so Fargate ENIs get public IPs to reach ECR/Secrets Manager without NAT.
+  # Private (AZ1 + AZ2): RDS + ElastiCache — isolated, no internet route.
+  # --------------------------------------------------------------------------
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet1CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-1'
+        - Key: Type
+          Value: Public
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PublicSubnet2CIDR
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-2'
+        - Key: Type
+          Value: Public
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-1'
+        - Key: Type
+          Value: Private
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-2'
+        - Key: Type
+          Value: Private
+
+  # --------------------------------------------------------------------------
+  # Route Tables
+  # --------------------------------------------------------------------------
+
+  # Public route table — has a default route to the Internet Gateway
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-public-rt'
+
+  DefaultPublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # Private route table — NO default route. RDS and ElastiCache are isolated.
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-private-rt'
+
+  PrivateSubnet1RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable
+
+  PrivateSubnet2RTAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable
+
+  # --------------------------------------------------------------------------
+  # Security Groups
+  #
+  # Traffic flow:
+  #   Internet → ALBSecurityGroup (80/443)
+  #            → BackendECSSecurityGroup (8080, from ALB)
+  #            → FrontendECSSecurityGroup (80, from ALB)
+  #   BackendECSSecurityGroup → RDSSecurityGroup (5432)
+  #   BackendECSSecurityGroup → ElastiCacheSecurityGroup (6379)
+  # --------------------------------------------------------------------------
+
+  # ALB: accepts public HTTP/HTTPS traffic, forwards to ECS containers
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-alb-sg'
+      GroupDescription: >
+        Public HTTP/HTTPS ingress. ALB forwards to ECS target groups.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: HTTP from internet
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: '0.0.0.0/0'
+        - Description: HTTPS from internet (for future TLS termination at ALB)
+          IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: '0.0.0.0/0'
+      # Egress: allow all — ALB must forward to ECS task IPs on any port
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-alb-sg'
+
+  # Backend ECS: Spring Boot on port 8080, reachable only from ALB
+  BackendECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-backend-ecs-sg'
+      GroupDescription: >
+        Spring Boot ECS containers. Inbound: port 8080 from ALB only.
+        Outbound: unrestricted (needs ECR, Secrets Manager, RDS, Redis).
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Spring Boot from ALB
+          IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      # Egress: all — Fargate pulls ECR images (443) + reaches RDS + Redis + Secrets Manager
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-ecs-sg'
+
+  # Frontend ECS: Nginx on port 80, reachable only from ALB
+  FrontendECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-frontend-ecs-sg'
+      GroupDescription: >
+        Nginx ECS containers. Inbound: port 80 from ALB only.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Nginx from ALB
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      # Egress: all — Fargate needs ECR image pull (443)
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-ecs-sg'
+
+  # RDS PostgreSQL: port 5432 accessible ONLY from backend ECS tasks
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-rds-sg'
+      GroupDescription: >
+        RDS PostgreSQL. Inbound: port 5432 from backend ECS SG only.
+        No public access. Located in private subnets.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: PostgreSQL from backend ECS
+          IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref BackendECSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-rds-sg'
+
+  # ElastiCache Redis: port 6379 accessible ONLY from backend ECS tasks
+  ElastiCacheSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-cache-sg'
+      GroupDescription: >
+        ElastiCache Redis. Inbound: port 6379 from backend ECS SG only.
+        No public access. Located in private subnets.
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Redis from backend ECS
+          IpProtocol: tcp
+          FromPort: 6379
+          ToPort: 6379
+          SourceSecurityGroupId: !Ref BackendECSSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-cache-sg'
+
+  # --------------------------------------------------------------------------
+  # CloudWatch Log Groups
+  # Pre-created so they are automatically deleted when the stack is torn down.
+  # RetentionInDays=1 keeps demo logs minimal; increase for longer debugging.
+  # --------------------------------------------------------------------------
+  BackendLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-backend'
+      RetentionInDays: 1
+
+  FrontendLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-frontend'
+      RetentionInDays: 1
+
+  # --------------------------------------------------------------------------
+  # IAM Roles
+  # --------------------------------------------------------------------------
+
+  # ECSTaskExecutionRole — assumed by the ECS AGENT (not the app) to:
+  #   • Pull container images from ECR
+  #   • Write logs to CloudWatch
+  #   • Retrieve secrets from Secrets Manager at task startup
+  ECSTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ecs-exec-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      # AWS managed policy: ECR image pull + CloudWatch Logs write
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: SecretsManagerReadForECS
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                # Scoped to secrets owned by this environment only
+                Resource:
+                  - !Sub 'arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${EnvironmentName}/*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ecs-exec-role'
+
+  # ECSTaskRole — assumed by the RUNNING APPLICATION CONTAINER to make
+  # AWS API calls at runtime (e.g. CloudWatch metrics, S3 access if needed).
+  # Currently grants CloudWatch Logs write for the app's own log streams.
+  ECSTaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${EnvironmentName}-ecs-task-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CloudWatchLogsWrite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !GetAtt BackendLogGroup.Arn
+                  - !GetAtt FrontendLogGroup.Arn
+                  - !Sub '${BackendLogGroup.Arn}:*'
+                  - !Sub '${FrontendLogGroup.Arn}:*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-ecs-task-role'
+
+# ============================================================================
+# Outputs — exported for cross-stack references by 02-data and 03-compute
+# ============================================================================
+Outputs:
+
+  EnvironmentName:
+    Description: Stack environment prefix used across all stacks
+    Value: !Ref EnvironmentName
+    Export:
+      Name: !Sub '${EnvironmentName}:EnvironmentName'
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${EnvironmentName}:VpcId'
+
+  PublicSubnet1Id:
+    Description: Public subnet AZ1 (ECS + ALB)
+    Value: !Ref PublicSubnet1
+    Export:
+      Name: !Sub '${EnvironmentName}:PublicSubnet1Id'
+
+  PublicSubnet2Id:
+    Description: Public subnet AZ2 (ECS + ALB)
+    Value: !Ref PublicSubnet2
+    Export:
+      Name: !Sub '${EnvironmentName}:PublicSubnet2Id'
+
+  PrivateSubnet1Id:
+    Description: Private subnet AZ1 (RDS + ElastiCache)
+    Value: !Ref PrivateSubnet1
+    Export:
+      Name: !Sub '${EnvironmentName}:PrivateSubnet1Id'
+
+  PrivateSubnet2Id:
+    Description: Private subnet AZ2 (RDS subnet group)
+    Value: !Ref PrivateSubnet2
+    Export:
+      Name: !Sub '${EnvironmentName}:PrivateSubnet2Id'
+
+  PublicSubnetIds:
+    Description: Comma-separated public subnet IDs (for ALB and ECS)
+    Value: !Sub '${PublicSubnet1},${PublicSubnet2}'
+    Export:
+      Name: !Sub '${EnvironmentName}:PublicSubnetIds'
+
+  PrivateSubnetIds:
+    Description: Comma-separated private subnet IDs (for RDS + ElastiCache)
+    Value: !Sub '${PrivateSubnet1},${PrivateSubnet2}'
+    Export:
+      Name: !Sub '${EnvironmentName}:PrivateSubnetIds'
+
+  ALBSecurityGroupId:
+    Description: Security group ID for Application Load Balancers
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:ALBSecurityGroupId'
+
+  BackendECSSecurityGroupId:
+    Description: Security group ID for backend ECS containers
+    Value: !Ref BackendECSSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendECSSecurityGroupId'
+
+  FrontendECSSecurityGroupId:
+    Description: Security group ID for frontend ECS containers
+    Value: !Ref FrontendECSSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendECSSecurityGroupId'
+
+  RDSSecurityGroupId:
+    Description: Security group ID for RDS PostgreSQL
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:RDSSecurityGroupId'
+
+  ElastiCacheSecurityGroupId:
+    Description: Security group ID for ElastiCache Redis
+    Value: !Ref ElastiCacheSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:ElastiCacheSecurityGroupId'
+
+  ECSTaskExecutionRoleArn:
+    Description: ARN of the ECS task execution role (used by ECS agent)
+    Value: !GetAtt ECSTaskExecutionRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}:ECSTaskExecutionRoleArn'
+
+  ECSTaskRoleArn:
+    Description: ARN of the ECS task role (used by application container)
+    Value: !GetAtt ECSTaskRole.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}:ECSTaskRoleArn'
+
+  BackendLogGroupName:
+    Description: CloudWatch log group for backend ECS tasks
+    Value: !Ref BackendLogGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendLogGroupName'
+
+  FrontendLogGroupName:
+    Description: CloudWatch log group for frontend ECS tasks
+    Value: !Ref FrontendLogGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendLogGroupName'

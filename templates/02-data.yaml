@@ -1,0 +1,438 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ecommerce-infra | Stack 2/3 — Data Layer
+  Provisions ECR repositories (backend + frontend), RDS PostgreSQL db.t3.micro
+  (free-tier), ElastiCache Redis cache.t2.micro (free-tier), and Secrets Manager
+  secrets for DB credentials and JWT signing key. Secrets are auto-generated and
+  injected into ECS tasks at runtime — no manual secret management required.
+  PREREQUISITE: 01-networking stack must be deployed first.
+
+# ============================================================================
+# Parameters
+# ============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: ecommerce-demo
+    Description: >
+      Must match exactly the EnvironmentName used in 01-networking.yaml.
+      Cross-stack imports use this as the export name prefix.
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Lowercase alphanumeric and hyphens only.
+
+  DBName:
+    Type: String
+    Default: ecommerce
+    Description: Initial database created inside the RDS PostgreSQL instance.
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+    ConstraintDescription: Must begin with a letter, alphanumeric and underscores only.
+
+  DBMasterUsername:
+    Type: String
+    Default: dbadmin
+    Description: Master username for RDS PostgreSQL. Stored in Secrets Manager.
+    AllowedPattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+
+  RDSInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    Description: >
+      Free-tier eligible: db.t3.micro (750 hrs/month, 12 months for new accounts).
+      DO NOT change this for demo usage — free tier applies to db.t3.micro only.
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+
+  CacheNodeType:
+    Type: String
+    Default: cache.t2.micro
+    Description: >
+      Free-tier eligible: cache.t2.micro (750 hrs/month, 12 months for new accounts).
+      DO NOT change this for demo usage.
+    AllowedValues:
+      - cache.t2.micro
+      - cache.t3.micro
+      - cache.t3.small
+
+# ============================================================================
+# Metadata
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment (must match Stack 1 value)"
+        Parameters: [EnvironmentName]
+      - Label:
+          default: "RDS Configuration — Free Tier"
+        Parameters: [DBName, DBMasterUsername, RDSInstanceClass]
+      - Label:
+          default: "ElastiCache Configuration — Free Tier"
+        Parameters: [CacheNodeType]
+    ParameterLabels:
+      EnvironmentName:
+        default: "Environment / Stack Prefix"
+      DBName:
+        default: "Database Name"
+      DBMasterUsername:
+        default: "DB Master Username"
+      RDSInstanceClass:
+        default: "RDS Instance Class (free tier = db.t3.micro)"
+      CacheNodeType:
+        default: "ElastiCache Node Type (free tier = cache.t2.micro)"
+
+# ============================================================================
+# Resources
+# ============================================================================
+Resources:
+
+  ##############################################################################
+  # ECR Repositories
+  #
+  # Naming convention: {env}-backend and {env}-frontend
+  # GitHub Actions workflows read the repo names from stack outputs — no
+  # hardcoded names in the workflows.
+  #
+  # EmptyOnDelete: true — images are deleted before the repo during teardown.
+  # Lifecycle policy: keeps last 3 images (stays within 500MB free-tier limit).
+  ##############################################################################
+
+  BackendECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${EnvironmentName}-backend'
+      ImageTagMutability: MUTABLE   # Allows pushing 'latest' tag
+      EmptyOnDelete: true           # Auto-deletes all images on stack teardown
+      ImageScanningConfiguration:
+        ScanOnPush: false           # Disabled — scan costs time in CI pipeline
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 3 images — stays within ECR free-tier 500MB",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 3
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FrontendECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${EnvironmentName}-frontend'
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 3 images — stays within ECR free-tier 500MB",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 3
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ##############################################################################
+  # Secrets Manager
+  #
+  # RDSSecret:
+  #   Auto-generates a strong 32-char alphanumeric password.
+  #   Initial content: {"username": "dbadmin", "dbname": "ecommerce",
+  #                      "port": "5432", "password": "<auto>"}
+  #
+  #   After RDSSecretAttachment runs, AWS enriches the secret with:
+  #     "host"                  → RDS endpoint address
+  #     "engine"                → "postgres"
+  #     "dbInstanceIdentifier"  → RDS instance ID
+  #
+  #   Final secret (used by ECS task valueFrom):
+  #     username, password, host, port, dbname, engine
+  #   No manual steps needed — ECS pulls every field dynamically at startup.
+  #
+  # JWTSecret:
+  #   Auto-generates a 64-char alphanumeric JWT signing key.
+  #   Content: {"secret": "<64 alphanumeric chars>"}
+  ##############################################################################
+
+  RDSSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${EnvironmentName}/rds'
+      Description: !Sub 'Auto-generated RDS PostgreSQL credentials for ${EnvironmentName}'
+      GenerateSecretString:
+        # password key is auto-generated; other fields are set here
+        SecretStringTemplate: !Sub >-
+          {"username": "${DBMasterUsername}", "dbname": "${DBName}", "port": "5432"}
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludePunctuation: true      # Avoids chars that break JDBC connection strings
+        ExcludeCharacters: '"@/\\'   # Extra safety for URL-embedded credentials
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  JWTSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Name: !Sub '${EnvironmentName}/jwt'
+      Description: !Sub 'Auto-generated JWT signing key for ${EnvironmentName} Spring Boot backend'
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: secret
+        PasswordLength: 64
+        ExcludePunctuation: true    # JWT secret must be alphanumeric for jjwt library
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ##############################################################################
+  # RDS PostgreSQL — Free Tier Configuration
+  #
+  # Instance:      db.t3.micro (1 vCPU, 1GB RAM)
+  # Storage:       20 GB gp2 (free-tier maximum)
+  # Availability:  Single-AZ (free tier; Multi-AZ costs extra)
+  # Access:        Private subnets only — not publicly accessible
+  # Backups:       Disabled (BackupRetentionPeriod=0) — faster teardown
+  # Deletion:      DeletionPolicy=Delete + SkipFinalSnapshot=true = clean teardown
+  #
+  # To find valid EngineVersion values for your region:
+  #   aws rds describe-db-engine-versions \
+  #     --engine postgres \
+  #     --query 'DBEngineVersions[].EngineVersion'
+  ##############################################################################
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub '${EnvironmentName}-db-subnet-group'
+      DBSubnetGroupDescription: !Sub 'Private subnets (AZ1+AZ2) for ${EnvironmentName} RDS'
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PrivateSubnet2Id'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-db-subnet-group'
+
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Delete          # Delete instance when stack is torn down
+    UpdateReplacePolicy: Delete
+    DependsOn: RDSSecret            # Secret must exist before dynamic reference resolves
+    Properties:
+      DBInstanceIdentifier: !Sub '${EnvironmentName}-db'
+      DBInstanceClass: !Ref RDSInstanceClass
+      Engine: postgres
+      EngineVersion: '16.4'         # PostgreSQL 16 — update if not available in your region
+      DBName: !Ref DBName
+      # Credentials pulled from RDSSecret via dynamic reference (no plaintext in template)
+      MasterUsername: !Sub '{{resolve:secretsmanager:${EnvironmentName}/rds:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${EnvironmentName}/rds:SecretString:password}}'
+      AllocatedStorage: '20'        # GB — free-tier maximum is 20GB
+      StorageType: gp2
+      StorageEncrypted: false       # Encryption not required for demo
+      MultiAZ: false                # Free tier: single-AZ only
+      PubliclyAccessible: false     # Private subnet access only
+      BackupRetentionPeriod: 0      # Disable automated backups (saves time + storage on teardown)
+      DeletionProtection: false     # Must be false to allow stack teardown to delete the DB
+      SkipFinalSnapshot: true       # No orphan snapshots after teardown
+      AutoMinorVersionUpgrade: false
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:RDSSecurityGroupId'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-db'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  # Attaches the RDS instance endpoint details to the RDSSecret.
+  # After this resource is created, the secret is automatically updated with:
+  #   "host"  → DBInstance.Endpoint.Address
+  #   "port"  → DBInstance.Endpoint.Port
+  #   "engine" → "postgres"
+  #   "dbInstanceIdentifier" → DBInstance ID
+  # The Spring Boot ECS task uses these keys via secrets valueFrom at startup.
+  RDSSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref RDSSecret
+      TargetId: !Ref DBInstance
+      TargetType: AWS::RDS::DBInstance
+
+  ##############################################################################
+  # ElastiCache Redis — Free Tier Configuration
+  #
+  # Node type:  cache.t2.micro (free-tier eligible)
+  # Nodes:      1 (single node — no replication, no cluster mode)
+  # TLS:        Disabled (TransitEncryption is a ReplicationGroup feature)
+  #             Redis is protected by security group — only backend ECS can reach it.
+  # Auth:       No AUTH token required (within VPC, SG enforces access control)
+  # Note:       Set REDIS_SSL=false in ECS task environment (see 03-compute.yaml)
+  #
+  # To find valid EngineVersion values:
+  #   aws elasticache describe-cache-engine-versions --engine redis
+  ##############################################################################
+
+  ElastiCacheSubnetGroup:
+    Type: AWS::ElastiCache::SubnetGroup
+    Properties:
+      CacheSubnetGroupName: !Sub '${EnvironmentName}-cache-subnet-group'
+      Description: !Sub 'Private subnets for ${EnvironmentName} ElastiCache Redis'
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PrivateSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PrivateSubnet2Id'
+
+  ElastiCacheCluster:
+    Type: AWS::ElastiCache::CacheCluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-redis'
+      Engine: redis
+      EngineVersion: '7.1'           # Redis 7.1 — stable, widely supported
+      CacheNodeType: !Ref CacheNodeType
+      NumCacheNodes: 1               # Single node — free-tier eligible
+      CacheSubnetGroupName: !Ref ElastiCacheSubnetGroup
+      VpcSecurityGroupIds:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:ElastiCacheSecurityGroupId'
+      # Port 6379 is the Redis default — same as application.properties default
+      Port: 6379
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-redis'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+# ============================================================================
+# Outputs — exported for cross-stack reference by 03-compute.yaml
+# ============================================================================
+Outputs:
+
+  # ── ECR ──────────────────────────────────────────────────────────────────
+
+  BackendECRRepositoryUri:
+    Description: >
+      Full ECR URI for the backend image (e.g. 123456789.dkr.ecr.ap-southeast-2.amazonaws.com/ecommerce-demo-backend).
+      Used in GitHub Actions docker build/push commands.
+    Value: !GetAtt BackendECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendECRRepositoryUri'
+
+  FrontendECRRepositoryUri:
+    Description: >
+      Full ECR URI for the frontend image.
+      Used in GitHub Actions docker build/push commands.
+    Value: !GetAtt FrontendECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendECRRepositoryUri'
+
+  BackendECRRepositoryName:
+    Description: ECR repository name for the backend (set as ECR_REPOSITORY in GitHub Actions)
+    Value: !Ref BackendECRRepository
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendECRRepositoryName'
+
+  FrontendECRRepositoryName:
+    Description: ECR repository name for the frontend (set as ECR_REPOSITORY in GitHub Actions)
+    Value: !Ref FrontendECRRepository
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendECRRepositoryName'
+
+  # ── Secrets Manager ──────────────────────────────────────────────────────
+
+  RDSSecretArn:
+    Description: >
+      ARN of the RDS credentials secret. After stack deployment, this secret
+      contains: username, password, host, port, dbname (plus engine fields).
+      Referenced by ECS task definition Secrets to inject DB_* env vars at
+      container startup — no hardcoded values anywhere.
+    Value: !Ref RDSSecret
+    Export:
+      Name: !Sub '${EnvironmentName}:RDSSecretArn'
+
+  JWTSecretArn:
+    Description: >
+      ARN of the JWT signing key secret. Contains key "secret" with a 64-char
+      alphanumeric value. Referenced by ECS task definition to inject JWT_SECRET.
+    Value: !Ref JWTSecret
+    Export:
+      Name: !Sub '${EnvironmentName}:JWTSecretArn'
+
+  # ── RDS ──────────────────────────────────────────────────────────────────
+
+  RDSEndpoint:
+    Description: >
+      RDS PostgreSQL endpoint hostname. Non-sensitive — injected as plain env
+      var DB_HOST into the backend ECS task (backup in case SecretAttachment
+      hasn't propagated yet).
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub '${EnvironmentName}:RDSEndpoint'
+
+  RDSPort:
+    Description: RDS PostgreSQL port (5432)
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub '${EnvironmentName}:RDSPort'
+
+  DBName:
+    Description: PostgreSQL database name (value of DBName parameter)
+    Value: !Ref DBName
+    Export:
+      Name: !Sub '${EnvironmentName}:DBName'
+
+  # ── ElastiCache ──────────────────────────────────────────────────────────
+
+  ElastiCacheEndpoint:
+    Description: >
+      ElastiCache Redis primary endpoint hostname. Injected as plain env var
+      REDIS_HOST into the backend ECS task. Non-sensitive (within VPC).
+    Value: !GetAtt ElastiCacheCluster.RedisEndpoint.Address
+    Export:
+      Name: !Sub '${EnvironmentName}:ElastiCacheEndpoint'
+
+  ElastiCachePort:
+    Description: ElastiCache Redis port (6379)
+    Value: !GetAtt ElastiCacheCluster.RedisEndpoint.Port
+    Export:
+      Name: !Sub '${EnvironmentName}:ElastiCachePort'

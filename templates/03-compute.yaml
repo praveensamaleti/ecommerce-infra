@@ -1,0 +1,605 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  ecommerce-infra | Stack 3/3 — Compute Layer
+  Provisions the ECS Cluster, two Application Load Balancers (backend + frontend),
+  Target Groups, ECS Task Definitions (with full Secrets Manager injection — no
+  hardcoded secrets), and ECS Fargate Services.
+  Services start with DesiredCount=0; the CI pipeline builds images and scales
+  them up on first deploy.
+  PREREQUISITE: 01-networking and 02-data stacks must be deployed first.
+
+# ============================================================================
+# Parameters
+# ============================================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: ecommerce-demo
+    Description: >
+      Must match exactly the EnvironmentName used in stacks 1 and 2.
+      Used to import cross-stack exports.
+    AllowedPattern: '^[a-z0-9-]+$'
+    ConstraintDescription: Lowercase alphanumeric and hyphens only.
+
+  BackendCpu:
+    Type: String
+    Default: '512'
+    Description: >
+      Fargate CPU units for the backend task (512 = 0.5 vCPU).
+      Spring Boot 3 needs at least 512 to start reliably.
+      Valid Fargate combos: 256/512, 512/1024-4096, 1024/2048-8192.
+    AllowedValues: ['256', '512', '1024']
+
+  BackendMemory:
+    Type: String
+    Default: '1024'
+    Description: >
+      Fargate memory (MB) for the backend task. 1024 MB is the minimum
+      recommended for Spring Boot 3 with Redis + PostgreSQL connections.
+    AllowedValues: ['512', '1024', '2048']
+
+  FrontendCpu:
+    Type: String
+    Default: '256'
+    Description: Fargate CPU units for the frontend task (256 = 0.25 vCPU).
+    AllowedValues: ['256', '512']
+
+  FrontendMemory:
+    Type: String
+    Default: '512'
+    Description: Fargate memory (MB) for the frontend Nginx task.
+    AllowedValues: ['512', '1024']
+
+# ============================================================================
+# Metadata
+# ============================================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Environment (must match Stacks 1 and 2)"
+        Parameters: [EnvironmentName]
+      - Label:
+          default: "Backend Fargate Sizing (minimal = lowest cost)"
+        Parameters: [BackendCpu, BackendMemory]
+      - Label:
+          default: "Frontend Fargate Sizing (minimal = lowest cost)"
+        Parameters: [FrontendCpu, FrontendMemory]
+    ParameterLabels:
+      BackendCpu:
+        default: "Backend CPU (512 recommended)"
+      BackendMemory:
+        default: "Backend Memory MB (1024 recommended)"
+      FrontendCpu:
+        default: "Frontend CPU (256 recommended)"
+      FrontendMemory:
+        default: "Frontend Memory MB (512 recommended)"
+
+# ============================================================================
+# Resources
+# ============================================================================
+Resources:
+
+  ##############################################################################
+  # ECS Cluster
+  # Container Insights disabled — not free tier. Enable manually if needed.
+  ##############################################################################
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub '${EnvironmentName}-cluster'
+      ClusterSettings:
+        - Name: containerInsights
+          Value: disabled
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-cluster'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ##############################################################################
+  # Backend ALB + Target Group + Listener
+  #
+  # Routes HTTP:80 → backend ECS tasks on port 8080.
+  # Health check uses 200-499 matcher:
+  #   Spring Boot with security enabled returns 401/403 for unauthenticated
+  #   requests to /, which is correct — the app IS running.
+  #   We don't add spring-boot-starter-actuator to the app to keep it simple.
+  # DeregistrationDelay=30s speeds up rolling deploys during demo sessions.
+  ##############################################################################
+  BackendALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-backend-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PublicSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PublicSubnet2Id'
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:ALBSecurityGroupId'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-alb'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  BackendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-backend-tg'
+      Port: 8080
+      Protocol: HTTP
+      TargetType: ip              # ip target type required for ECS Fargate (awsvpc)
+      VpcId: !ImportValue
+        Fn::Sub: '${EnvironmentName}:VpcId'
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2    # Pass 2 consecutive checks = healthy
+      UnhealthyThresholdCount: 3  # Fail 3 consecutive checks = unhealthy
+      Matcher:
+        HttpCode: '200-499'       # Accept 401/403 from Spring Security as healthy
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'             # Faster rolling deploys (default=300s)
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-tg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  BackendALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref BackendALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTargetGroup
+
+  ##############################################################################
+  # Frontend ALB + Target Group + Listener
+  #
+  # Routes HTTP:80 → frontend ECS tasks on port 80 (Nginx).
+  # Standard 200 health check — nginx always returns 200 for /.
+  ##############################################################################
+  FrontendALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-frontend-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PublicSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PublicSubnet2Id'
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:ALBSecurityGroupId'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-alb'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FrontendTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-frontend-tg'
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: '${EnvironmentName}:VpcId'
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-tg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  FrontendALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref FrontendALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTargetGroup
+
+  ##############################################################################
+  # Backend ECS Task Definition
+  #
+  # Secrets Manager injection (pulled at container startup by ECS agent):
+  #   DB_HOST, DB_USERNAME, DB_PASSWORD, DB_NAME  ← from {env}/rds secret
+  #   JWT_SECRET                                  ← from {env}/jwt secret
+  #
+  # Plain environment variables (non-sensitive):
+  #   REDIS_HOST    ← ElastiCache endpoint from stack output
+  #   REDIS_PORT    ← 6379
+  #   REDIS_SSL     ← false (ElastiCache CacheCluster has no TLS; SG protects it)
+  #   REDIS_PASSWORD← empty (no AUTH required within VPC)
+  #   DB_PORT       ← 5432
+  #
+  # Image: ECR URI with :latest tag — placeholder until CI pushes first build.
+  # CI workflow downloads THIS task definition family, updates the image to
+  # the newly-built SHA-tagged image, registers a new revision, and updates
+  # the ECS service. No local task-definition.json files needed.
+  ##############################################################################
+  BackendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-backend'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref BackendCpu
+      Memory: !Ref BackendMemory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${EnvironmentName}:ECSTaskExecutionRoleArn'
+      TaskRoleArn: !ImportValue
+        Fn::Sub: '${EnvironmentName}:ECSTaskRoleArn'
+      ContainerDefinitions:
+        - Name: ecommerce-backend
+          # Placeholder image — CI pipeline replaces this on first deploy
+          Image: !Join
+            - ''
+            - - !ImportValue
+                  Fn::Sub: '${EnvironmentName}:BackendECRRepositoryUri'
+              - ':latest'
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          Essential: true
+
+          # ── Secrets Manager injection ──────────────────────────────────────
+          # Each ValueFrom is: <secret-ARN>:<json-key>::
+          # The ECSTaskExecutionRole has secretsmanager:GetSecretValue scoped
+          # to arn:...:secret:{EnvironmentName}/* which matches both secrets.
+          # After RDSSecretAttachment in stack 2, the RDS secret contains:
+          #   username, password, host, port, dbname, engine
+          Secrets:
+            - Name: DB_HOST
+              ValueFrom: !Join
+                - ''
+                - - !ImportValue
+                      Fn::Sub: '${EnvironmentName}:RDSSecretArn'
+                  - ':host::'
+            - Name: DB_USERNAME
+              ValueFrom: !Join
+                - ''
+                - - !ImportValue
+                      Fn::Sub: '${EnvironmentName}:RDSSecretArn'
+                  - ':username::'
+            - Name: DB_PASSWORD
+              ValueFrom: !Join
+                - ''
+                - - !ImportValue
+                      Fn::Sub: '${EnvironmentName}:RDSSecretArn'
+                  - ':password::'
+            - Name: DB_NAME
+              ValueFrom: !Join
+                - ''
+                - - !ImportValue
+                      Fn::Sub: '${EnvironmentName}:RDSSecretArn'
+                  - ':dbname::'
+            - Name: JWT_SECRET
+              ValueFrom: !Join
+                - ''
+                - - !ImportValue
+                      Fn::Sub: '${EnvironmentName}:JWTSecretArn'
+                  - ':secret::'
+
+          # ── Plain environment variables (non-sensitive) ────────────────────
+          Environment:
+            - Name: DB_PORT
+              Value: '5432'
+            - Name: REDIS_HOST
+              Value: !ImportValue
+                Fn::Sub: '${EnvironmentName}:ElastiCacheEndpoint'
+            - Name: REDIS_PORT
+              Value: '6379'
+            - Name: REDIS_SSL
+              # false: ElastiCache CacheCluster does not support TLS.
+              # The connection is secured by the ElastiCacheSecurityGroup (SG-to-SG rule).
+              Value: 'false'
+            - Name: REDIS_PASSWORD
+              Value: ''           # No AUTH token; within-VPC access is controlled by SG
+            - Name: SERVER_PORT
+              Value: '8080'
+            - Name: SPRING_JPA_HIBERNATE_DDL_AUTO
+              Value: update       # Creates/updates tables on startup
+
+          # ── CloudWatch Logs ────────────────────────────────────────────────
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${EnvironmentName}:BackendLogGroupName'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ##############################################################################
+  # Frontend ECS Task Definition
+  #
+  # REACT_APP_API_URL is baked into the static build at docker build time —
+  # it cannot be injected as a runtime env var for a React CRA app.
+  # The GitHub Actions workflow reads BackendALBDNS from CloudFormation outputs
+  # and passes it as --build-arg REACT_APP_API_URL=http://{dns} during docker build.
+  # See react-ecommerce-app/.github/workflows/deploy.yml (updated in Chunk 4).
+  #
+  # No Secrets are needed for the frontend container.
+  ##############################################################################
+  FrontendTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-frontend'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref FrontendCpu
+      Memory: !Ref FrontendMemory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${EnvironmentName}:ECSTaskExecutionRoleArn'
+      # No TaskRoleArn needed — frontend Nginx has no AWS API calls at runtime
+      ContainerDefinitions:
+        - Name: react-ecommerce-container
+          # Placeholder image — CI pipeline replaces this on first deploy
+          Image: !Join
+            - ''
+            - - !ImportValue
+                  Fn::Sub: '${EnvironmentName}:FrontendECRRepositoryUri'
+              - ':latest'
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Essential: true
+          # No Secrets or Environment needed here.
+          # REACT_APP_API_URL is embedded in the JS bundle at build time.
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${EnvironmentName}:FrontendLogGroupName'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ##############################################################################
+  # Backend ECS Service
+  #
+  # DesiredCount: 0 — No tasks run until CI deploys the first real image.
+  # The CI workflow (Chunk 4) sets desired-count to 1 via aws ecs update-service.
+  #
+  # AssignPublicIp: ENABLED — Required because there is no NAT Gateway.
+  # Fargate task ENIs get a public IP to pull from ECR and call Secrets Manager.
+  # The BackendECSSecurityGroup only allows inbound on port 8080 from ALB SG,
+  # so the public IP does not expose the container to arbitrary internet traffic.
+  #
+  # HealthCheckGracePeriodSeconds: 60 — Spring Boot 3 typically takes 30-60s
+  # to fully start (DB + Redis connections, JPA schema validation). ALB health
+  # checks are ignored during this grace period.
+  #
+  # DeploymentCircuitBreaker: auto-rolls back if the new task fails to start.
+  ##############################################################################
+  BackendECSService:
+    Type: AWS::ECS::Service
+    DependsOn: BackendALBListener   # ALB must have a listener before target group attachment
+    Properties:
+      ServiceName: !Sub '${EnvironmentName}-backend-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref BackendTaskDefinition
+      DesiredCount: 0               # CI sets this to 1 on first successful image push
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED   # No NAT GW — public IP required for ECR + Secrets Manager
+          Subnets:
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:PublicSubnet1Id'
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:PublicSubnet2Id'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:BackendECSSecurityGroupId'
+      LoadBalancers:
+        - ContainerName: ecommerce-backend    # Must match ContainerDefinitions[].Name above
+          ContainerPort: 8080
+          TargetGroupArn: !Ref BackendTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0    # Allows stopping old task before new one is healthy (1-task demo)
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true            # Auto-rollback if new deployment fails health checks
+      HealthCheckGracePeriodSeconds: 60
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-backend-service'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ##############################################################################
+  # Frontend ECS Service
+  #
+  # DesiredCount: 0 — same pattern as backend.
+  # HealthCheckGracePeriodSeconds: 30 — Nginx starts nearly instantly.
+  ##############################################################################
+  FrontendECSService:
+    Type: AWS::ECS::Service
+    DependsOn: FrontendALBListener
+    Properties:
+      ServiceName: !Sub '${EnvironmentName}-frontend-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref FrontendTaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:PublicSubnet1Id'
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:PublicSubnet2Id'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:FrontendECSSecurityGroupId'
+      LoadBalancers:
+        - ContainerName: react-ecommerce-container   # Must match ContainerDefinitions[].Name above
+          ContainerPort: 80
+          TargetGroupArn: !Ref FrontendTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-frontend-service'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+# ============================================================================
+# Outputs
+# ============================================================================
+Outputs:
+
+  ECSClusterName:
+    Description: ECS cluster name (used in GitHub Actions ECS_CLUSTER variable)
+    Value: !Ref ECSCluster
+    Export:
+      Name: !Sub '${EnvironmentName}:ECSClusterName'
+
+  ECSClusterArn:
+    Description: ECS cluster ARN
+    Value: !GetAtt ECSCluster.Arn
+    Export:
+      Name: !Sub '${EnvironmentName}:ECSClusterArn'
+
+  # ── Backend outputs ───────────────────────────────────────────────────────
+
+  BackendALBDNS:
+    Description: >
+      Backend ALB DNS name. This is the value to use for REACT_APP_API_URL
+      when building the frontend Docker image. Format: http://{dns}
+      The GitHub Actions frontend workflow reads this automatically from
+      CloudFormation stack outputs before running docker build.
+    Value: !GetAtt BackendALB.DNSName
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendALBDNS'
+
+  BackendALBUrl:
+    Description: Full HTTP URL for the backend ALB (for browser/curl testing)
+    Value: !Sub 'http://${BackendALB.DNSName}'
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendALBUrl'
+
+  BackendServiceName:
+    Description: ECS service name for the backend (used in GitHub Actions ECS_SERVICE)
+    Value: !GetAtt BackendECSService.Name
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendServiceName'
+
+  BackendTaskDefFamily:
+    Description: >
+      Backend task definition family name. GitHub Actions uses this to download
+      the current task definition, inject the new image, and register a new revision.
+    Value: !Sub '${EnvironmentName}-backend'
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendTaskDefFamily'
+
+  BackendContainerName:
+    Description: Container name in backend task definition (used by amazon-ecs-render-task-definition)
+    Value: ecommerce-backend
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendContainerName'
+
+  BackendECRRepositoryUri:
+    Description: ECR URI for backend — convenience re-export from data stack
+    Value: !ImportValue
+      Fn::Sub: '${EnvironmentName}:BackendECRRepositoryUri'
+    Export:
+      Name: !Sub '${EnvironmentName}:BackendECRUri'
+
+  # ── Frontend outputs ──────────────────────────────────────────────────────
+
+  FrontendALBDNS:
+    Description: >
+      Frontend ALB DNS name. Share this URL with demo attendees.
+      The React app is accessible at http://{this-value}.
+    Value: !GetAtt FrontendALB.DNSName
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendALBDNS'
+
+  FrontendALBUrl:
+    Description: Full HTTP URL for the frontend ALB (the demo URL)
+    Value: !Sub 'http://${FrontendALB.DNSName}'
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendALBUrl'
+
+  FrontendServiceName:
+    Description: ECS service name for the frontend (used in GitHub Actions ECS_SERVICE)
+    Value: !GetAtt FrontendECSService.Name
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendServiceName'
+
+  FrontendTaskDefFamily:
+    Description: Frontend task definition family name for GitHub Actions
+    Value: !Sub '${EnvironmentName}-frontend'
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendTaskDefFamily'
+
+  FrontendContainerName:
+    Description: Container name in frontend task definition
+    Value: react-ecommerce-container
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendContainerName'
+
+  FrontendECRRepositoryUri:
+    Description: ECR URI for frontend — convenience re-export from data stack
+    Value: !ImportValue
+      Fn::Sub: '${EnvironmentName}:FrontendECRRepositoryUri'
+    Export:
+      Name: !Sub '${EnvironmentName}:FrontendECRUri'
+
+  # ── Summary output for quick reference ───────────────────────────────────
+
+  DemoURLs:
+    Description: >
+      Quick-reference URLs after first CI deploy completes.
+      Frontend (demo URL): http://{FrontendALBDNS}
+      Backend API:         http://{BackendALBDNS}
+      Swagger UI:          http://{BackendALBDNS}/swagger-ui.html
+    Value: !Sub
+      - 'Frontend: http://${FE} | Backend: http://${BE} | Swagger: http://${BE}/swagger-ui.html'
+      - FE: !GetAtt FrontendALB.DNSName
+        BE: !GetAtt BackendALB.DNSName
