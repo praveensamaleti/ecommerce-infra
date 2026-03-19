@@ -272,7 +272,9 @@ Resources:
       PubliclyAccessible: false     # Private subnet access only
       BackupRetentionPeriod: 0      # Disable automated backups (saves time + storage on teardown)
       DeletionProtection: false     # Must be false to allow stack teardown to delete the DB
-      SkipFinalSnapshot: true       # No orphan snapshots after teardown
+      # SkipFinalSnapshot: true is now blocked by AWS::EarlyValidation::PropertyValidation.
+      # Omitting it — CloudFormation auto-names the snapshot on deletion.
+      # teardown-stack.sh cleans up the orphan snapshot after stack deletion.
       AutoMinorVersionUpgrade: false
       DBSubnetGroupName: !Ref DBSubnetGroup
       VPCSecurityGroups:

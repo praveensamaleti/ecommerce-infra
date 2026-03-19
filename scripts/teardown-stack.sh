@@ -11,7 +11,8 @@
 #   3. {env}-networking  (VPC, subnets, security groups, IAM roles)
 #
 # What happens to data:
-#   - RDS: deleted with SkipFinalSnapshot=true (NO backup — demo data is lost)
+#   - RDS: deleted with an auto-named final snapshot (AWS now blocks SkipFinalSnapshot=true
+#     via EarlyValidation). The snapshot is cleaned up by this script after stack deletion.
 #   - ECR: images deleted (EmptyOnDelete=true on the repository)
 #   - Secrets Manager: force-deleted immediately (no 30-day recovery window)
 #     so you can re-deploy with the same EnvironmentName without name conflicts.
@@ -41,7 +42,7 @@ echo -e "    ${YELLOW}$COMPUTE_STACK${NC}    (ECS services, ALBs, task definitio
 echo -e "    ${YELLOW}$DATA_STACK${NC}       (ECR repos+images, RDS DB, ElastiCache, Secrets)"
 echo -e "    ${YELLOW}$NETWORKING_STACK${NC} (VPC, subnets, security groups, IAM roles)"
 echo ""
-echo -e "  ${RED}All RDS data will be lost permanently (no final snapshot).${NC}"
+echo -e "  ${RED}All RDS data will be lost. Auto-named snapshot cleaned up post-teardown.${NC}"
 echo ""
 read -rp "  Type the environment name '$ENV_NAME' to confirm teardown: " CONFIRM
 echo ""
@@ -99,6 +100,33 @@ if aws cloudformation describe-stacks --stack-name "$DATA_STACK" --region "$AWS_
   ok "Data stack deleted"
 else
   echo "  Stack not found — skipped"
+fi
+
+# ── Clean up RDS auto-named final snapshot ────────────────────────────────────
+# AWS EarlyValidation now blocks SkipFinalSnapshot=true, so CloudFormation creates
+# an auto-named snapshot when the DBInstance is deleted. We delete it here so
+# re-deploying with the same EnvironmentName doesn't leave orphan snapshots.
+step "Cleaning up RDS final snapshot (auto-named by CloudFormation)"
+# The auto-named snapshot contains the DBInstanceIdentifier
+DB_ID="${ENV_NAME}-db"
+SNAPSHOTS=$(aws rds describe-db-snapshots \
+  --db-instance-identifier "$DB_ID" \
+  --snapshot-type manual \
+  --region "$AWS_REGION" \
+  --query 'DBSnapshots[].DBSnapshotIdentifier' \
+  --output text 2>/dev/null || true)
+
+if [ -n "$SNAPSHOTS" ]; then
+  for SNAP in $SNAPSHOTS; do
+    aws rds delete-db-snapshot \
+      --db-snapshot-identifier "$SNAP" \
+      --region "$AWS_REGION" 2>/dev/null \
+      && echo "  Deleted snapshot: $SNAP" \
+      || echo "  Could not delete: $SNAP"
+  done
+  ok "RDS snapshots cleaned up"
+else
+  echo "  No snapshots found for $DB_ID — skipped"
 fi
 
 # ── Force-delete Secrets Manager secrets ─────────────────────────────────────
