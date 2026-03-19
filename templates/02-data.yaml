@@ -47,12 +47,11 @@ Parameters:
 
   CacheNodeType:
     Type: String
-    Default: cache.t2.micro
+    Default: cache.t3.micro
     Description: >
-      Free-tier eligible: cache.t2.micro (750 hrs/month, 12 months for new accounts).
-      DO NOT change this for demo usage.
+      Free-tier eligible: cache.t3.micro (750 hrs/month, 12 months for new accounts).
+      Note: cache.t2.micro does NOT support Redis 7.x — use cache.t3.micro.
     AllowedValues:
-      - cache.t2.micro
       - cache.t3.micro
       - cache.t3.small
 
@@ -260,10 +259,11 @@ Resources:
       DBInstanceIdentifier: !Sub '${EnvironmentName}-db'
       DBInstanceClass: !Ref RDSInstanceClass
       Engine: postgres
-      EngineVersion: '16.4'         # PostgreSQL 16 — update if not available in your region
+      EngineVersion: '16.6'           # PostgreSQL 16.6 — earliest 16.x available in ap-southeast-2
       DBName: !Ref DBName
-      # Credentials pulled from RDSSecret via dynamic reference (no plaintext in template)
-      MasterUsername: !Sub '{{resolve:secretsmanager:${EnvironmentName}/rds:SecretString:username}}'
+      # MasterUsername uses the parameter directly (dynamic references not supported for this field)
+      MasterUsername: !Ref DBMasterUsername
+      # MasterUserPassword uses dynamic reference to the auto-generated Secrets Manager secret
       MasterUserPassword: !Sub '{{resolve:secretsmanager:${EnvironmentName}/rds:SecretString:password}}'
       AllocatedStorage: '20'        # GB — free-tier maximum is 20GB
       StorageType: gp2
