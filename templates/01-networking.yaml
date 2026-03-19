@@ -244,8 +244,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${EnvironmentName}-alb-sg'
-      GroupDescription: >
-        Public HTTP/HTTPS ingress. ALB forwards to ECS target groups.
+      GroupDescription: Public HTTP/HTTPS ingress - ALB forwards to ECS target groups
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - Description: HTTP from internet
@@ -268,9 +267,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${EnvironmentName}-backend-ecs-sg'
-      GroupDescription: >
-        Spring Boot ECS containers. Inbound: port 8080 from ALB only.
-        Outbound: unrestricted (needs ECR, Secrets Manager, RDS, Redis).
+      GroupDescription: Spring Boot ECS containers - inbound port 8080 from ALB only
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - Description: Spring Boot from ALB
@@ -288,8 +285,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${EnvironmentName}-frontend-ecs-sg'
-      GroupDescription: >
-        Nginx ECS containers. Inbound: port 80 from ALB only.
+      GroupDescription: Nginx ECS containers - inbound port 80 from ALB only
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - Description: Nginx from ALB
@@ -307,9 +303,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${EnvironmentName}-rds-sg'
-      GroupDescription: >
-        RDS PostgreSQL. Inbound: port 5432 from backend ECS SG only.
-        No public access. Located in private subnets.
+      GroupDescription: RDS PostgreSQL - port 5432 from backend ECS SG only
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - Description: PostgreSQL from backend ECS
@@ -326,9 +320,7 @@ Resources:
     Type: AWS::EC2::SecurityGroup
     Properties:
       GroupName: !Sub '${EnvironmentName}-cache-sg'
-      GroupDescription: >
-        ElastiCache Redis. Inbound: port 6379 from backend ECS SG only.
-        No public access. Located in private subnets.
+      GroupDescription: ElastiCache Redis - port 6379 from backend ECS SG only
       VpcId: !Ref VPC
       SecurityGroupIngress:
         - Description: Redis from backend ECS
