@@ -51,6 +51,18 @@ Parameters:
     Description: Fargate memory (MB) for the frontend Nginx task.
     AllowedValues: ['512', '1024']
 
+  AngularCpu:
+    Type: String
+    Default: '256'
+    Description: Fargate CPU units for the Angular task (256 = 0.25 vCPU).
+    AllowedValues: ['256', '512']
+
+  AngularMemory:
+    Type: String
+    Default: '512'
+    Description: Fargate memory (MB) for the Angular Nginx task.
+    AllowedValues: ['512', '1024']
+
 # ============================================================================
 # Metadata
 # ============================================================================
@@ -66,6 +78,9 @@ Metadata:
       - Label:
           default: "Frontend Fargate Sizing (minimal = lowest cost)"
         Parameters: [FrontendCpu, FrontendMemory]
+      - Label:
+          default: "Angular Fargate Sizing (minimal = lowest cost)"
+        Parameters: [AngularCpu, AngularMemory]
     ParameterLabels:
       BackendCpu:
         default: "Backend CPU (512 recommended)"
@@ -75,6 +90,10 @@ Metadata:
         default: "Frontend CPU (256 recommended)"
       FrontendMemory:
         default: "Frontend Memory MB (512 recommended)"
+      AngularCpu:
+        default: "Angular CPU (256 recommended)"
+      AngularMemory:
+        default: "Angular Memory MB (512 recommended)"
 
 # ============================================================================
 # Resources
@@ -488,6 +507,159 @@ Resources:
         - Key: Environment
           Value: !Ref EnvironmentName
 
+  ##############################################################################
+  # Angular ALB + Target Group + Listener
+  #
+  # Identical to React FrontendALB pattern: HTTP:80 -> Angular ECS tasks on 80.
+  # Standard 200 health check -- nginx always returns 200 for /.
+  ##############################################################################
+  AngularALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub '${EnvironmentName}-angular-alb'
+      Type: application
+      Scheme: internet-facing
+      Subnets:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PublicSubnet1Id'
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:PublicSubnet2Id'
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: '${EnvironmentName}:ALBSecurityGroupId'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-angular-alb'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AngularTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub '${EnvironmentName}-angular-tg'
+      Port: 80
+      Protocol: HTTP
+      TargetType: ip
+      VpcId: !ImportValue
+        Fn::Sub: '${EnvironmentName}:VpcId'
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-angular-tg'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  AngularALBListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref AngularALB
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AngularTargetGroup
+
+  ##############################################################################
+  # Angular ECS Task Definition
+  #
+  # API_URL is baked into the static bundle at docker build time via
+  # --build-arg API_URL=http://{BackendALBDNS}. The CI workflow reads
+  # BackendALBDNS from this compute stack's outputs before running docker build.
+  # See angular-ecommerce-app/.github/workflows/deploy.yml.
+  #
+  # No Secrets are needed for the Angular container.
+  ##############################################################################
+  AngularTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub '${EnvironmentName}-angular'
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      Cpu: !Ref AngularCpu
+      Memory: !Ref AngularMemory
+      ExecutionRoleArn: !ImportValue
+        Fn::Sub: '${EnvironmentName}:ECSTaskExecutionRoleArn'
+      # No TaskRoleArn needed -- Angular Nginx has no AWS API calls at runtime
+      ContainerDefinitions:
+        - Name: angular-ecommerce-container
+          # Placeholder image -- CI pipeline replaces this on first deploy
+          Image: !Join
+            - ''
+            - - !ImportValue
+                  Fn::Sub: '${EnvironmentName}:AngularECRRepositoryUri'
+              - ':latest'
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          Essential: true
+          # No Secrets or Environment needed here.
+          # API_URL is embedded in the JS bundle at build time.
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !ImportValue
+                Fn::Sub: '${EnvironmentName}:AngularLogGroupName'
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+      Tags:
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ##############################################################################
+  # Angular ECS Service
+  #
+  # DesiredCount: 0 -- same pattern as React frontend.
+  # HealthCheckGracePeriodSeconds: 30 -- Nginx starts nearly instantly.
+  ##############################################################################
+  AngularECSService:
+    Type: AWS::ECS::Service
+    DependsOn: AngularALBListener
+    Properties:
+      ServiceName: !Sub '${EnvironmentName}-angular-service'
+      Cluster: !Ref ECSCluster
+      TaskDefinition: !Ref AngularTaskDefinition
+      DesiredCount: 0
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets:
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:PublicSubnet1Id'
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:PublicSubnet2Id'
+          SecurityGroups:
+            - !ImportValue
+              Fn::Sub: '${EnvironmentName}:AngularECSSecurityGroupId'
+      LoadBalancers:
+        - ContainerName: angular-ecommerce-container  # Must match ContainerDefinitions[].Name above
+          ContainerPort: 80
+          TargetGroupArn: !Ref AngularTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 0
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 30
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-angular-service'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
 # ============================================================================
 # Outputs
 # ============================================================================
@@ -591,15 +763,57 @@ Outputs:
     Export:
       Name: !Sub '${EnvironmentName}:FrontendECRUri'
 
+  # ?? Angular outputs ????????????????????????????????????????????????????????
+
+  AngularALBDNS:
+    Description: >
+      Angular ALB DNS name. The Angular app is accessible at http://{this-value}.
+    Value: !GetAtt AngularALB.DNSName
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularALBDNS'
+
+  AngularALBUrl:
+    Description: Full HTTP URL for the Angular ALB
+    Value: !Sub 'http://${AngularALB.DNSName}'
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularALBUrl'
+
+  AngularServiceName:
+    Description: ECS service name for the Angular app (used in GitHub Actions ECS_SERVICE)
+    Value: !GetAtt AngularECSService.Name
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularServiceName'
+
+  AngularTaskDefFamily:
+    Description: Angular task definition family name for GitHub Actions
+    Value: !Sub '${EnvironmentName}-angular'
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularTaskDefFamily'
+
+  AngularContainerName:
+    Description: Container name in Angular task definition
+    Value: angular-ecommerce-container
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularContainerName'
+
+  AngularECRRepositoryUri:
+    Description: ECR URI for Angular app -- convenience re-export from data stack
+    Value: !ImportValue
+      Fn::Sub: '${EnvironmentName}:AngularECRRepositoryUri'
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularECRUri'
+
   # ?? Summary output for quick reference ???????????????????????????????????
 
   DemoURLs:
     Description: >
       Quick-reference URLs after first CI deploy completes.
-      Frontend (demo URL): http://{FrontendALBDNS}
-      Backend API:         http://{BackendALBDNS}
-      Swagger UI:          http://{BackendALBDNS}/swagger-ui.html
+      React Frontend:    http://{FrontendALBDNS}
+      Angular Frontend:  http://{AngularALBDNS}
+      Backend API:       http://{BackendALBDNS}
+      Swagger UI:        http://{BackendALBDNS}/swagger-ui.html
     Value: !Sub
-      - 'Frontend: http://${FE} | Backend: http://${BE} | Swagger: http://${BE}/swagger-ui.html'
-      - FE: !GetAtt FrontendALB.DNSName
-        BE: !GetAtt BackendALB.DNSName
+      - 'React: http://${FE} | Angular: http://${ANG} | Backend: http://${BE} | Swagger: http://${BE}/swagger-ui.html'
+      - FE:  !GetAtt FrontendALB.DNSName
+        ANG: !GetAtt AngularALB.DNSName
+        BE:  !GetAtt BackendALB.DNSName

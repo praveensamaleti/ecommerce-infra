@@ -163,6 +163,44 @@ Resources:
           Value: !Ref EnvironmentName
 
   ##############################################################################
+  # Angular ECR Repository
+  #
+  # Stores Angular 18 Nginx images built by angular-ecommerce-app CI pipeline.
+  # Same lifecycle policy as React frontend: keep last 3 images.
+  ##############################################################################
+  AngularECRRepository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      RepositoryName: !Sub '${EnvironmentName}-angular'
+      ImageTagMutability: MUTABLE
+      EmptyOnDelete: true
+      ImageScanningConfiguration:
+        ScanOnPush: false
+      LifecyclePolicy:
+        LifecyclePolicyText: !Sub |
+          {
+            "rules": [
+              {
+                "rulePriority": 1,
+                "description": "Keep last 3 images -- stays within ECR free-tier 500MB",
+                "selection": {
+                  "tagStatus": "any",
+                  "countType": "imageCountMoreThan",
+                  "countNumber": 3
+                },
+                "action": { "type": "expire" }
+              }
+            ]
+          }
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-angular'
+        - Key: Environment
+          Value: !Ref EnvironmentName
+
+  ##############################################################################
   # Secrets Manager
   #
   # RDSSecret:
@@ -379,6 +417,20 @@ Outputs:
     Value: !Ref FrontendECRRepository
     Export:
       Name: !Sub '${EnvironmentName}:FrontendECRRepositoryName'
+
+  AngularECRRepositoryUri:
+    Description: >
+      Full ECR URI for the Angular image (e.g. 123456789.dkr.ecr.ap-southeast-2.amazonaws.com/ecommerce-demo-angular).
+      Used in angular-ecommerce-app GitHub Actions docker build/push commands.
+    Value: !GetAtt AngularECRRepository.RepositoryUri
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularECRRepositoryUri'
+
+  AngularECRRepositoryName:
+    Description: ECR repository name for the Angular app (set as ECR_REPOSITORY in GitHub Actions)
+    Value: !Ref AngularECRRepository
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularECRRepositoryName'
 
   # -- Secrets Manager ------------------------------------------------------
 

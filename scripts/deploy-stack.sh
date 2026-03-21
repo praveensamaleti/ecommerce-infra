@@ -6,9 +6,9 @@
 # Example: ./deploy-stack.sh ecommerce-demo ap-southeast-2
 #
 # Stacks deployed (in order):
-#   1. {env}-networking  → VPC, subnets, SGs, IAM roles
-#   2. {env}-data        → ECR, RDS PostgreSQL, ElastiCache, Secrets Manager
-#   3. {env}-compute     → ECS cluster, ALBs, Task Definitions, ECS services
+#   1. {env}-networking  → VPC, subnets, SGs (incl. Angular), IAM roles, log groups
+#   2. {env}-data        → ECR (backend + frontend + angular), RDS, ElastiCache, Secrets
+#   3. {env}-compute     → ECS cluster, ALBs (backend + React + Angular), Task Defs, Services
 #
 # Prerequisites:
 #   - AWS CLI v2 installed and configured (aws configure)
@@ -96,9 +96,11 @@ ok "Compute stack ready"
 
 # ── Print key outputs ─────────────────────────────────────────────────────────
 FRONTEND_URL=$(get_output "FrontendALBUrl"  "$COMPUTE_STACK")
+ANGULAR_URL=$(get_output  "AngularALBUrl"   "$COMPUTE_STACK")
 BACKEND_URL=$(get_output  "BackendALBUrl"   "$COMPUTE_STACK")
 BACKEND_ECR=$(get_output  "BackendECRRepositoryUri"  "$COMPUTE_STACK")
 FRONTEND_ECR=$(get_output "FrontendECRRepositoryUri" "$COMPUTE_STACK")
+ANGULAR_ECR=$(get_output  "AngularECRRepositoryUri"  "$COMPUTE_STACK")
 ECS_CLUSTER=$(get_output  "ECSClusterName" "$COMPUTE_STACK")
 
 echo ""
@@ -107,23 +109,28 @@ echo -e "${GREEN}  All stacks deployed successfully!${NC}"
 echo -e "${GREEN}=================================================${NC}"
 echo ""
 echo "  Endpoints (available after first CI deploy):"
-echo "    Frontend URL  : $FRONTEND_URL"
+echo "    React URL     : $FRONTEND_URL"
+echo "    Angular URL   : $ANGULAR_URL"
 echo "    Backend URL   : $BACKEND_URL"
 echo "    Swagger UI    : ${BACKEND_URL}/swagger-ui.html"
 echo ""
 echo "  ECR Repositories:"
 echo "    Backend ECR   : $BACKEND_ECR"
 echo "    Frontend ECR  : $FRONTEND_ECR"
+echo "    Angular ECR   : $ANGULAR_ECR"
 echo ""
 echo "  ECS:"
 echo "    Cluster       : $ECS_CLUSTER"
 echo "    Backend svc   : ${ENV_NAME}-backend-service  (DesiredCount=0 until CI deploys)"
 echo "    Frontend svc  : ${ENV_NAME}-frontend-service (DesiredCount=0 until CI deploys)"
+echo "    Angular svc   : ${ENV_NAME}-angular-service  (DesiredCount=0 until CI deploys)"
 echo ""
 echo "  Next steps:"
-echo "    1. Set GitHub variable  STACK_NAME=$ENV_NAME  in both repos"
+echo "    1. Set GitHub variable  STACK_NAME=$ENV_NAME  in all repos"
 echo "    2. Trigger GitHub Actions (push to main, or use workflow_dispatch)"
-echo "    3. After CI completes, your demo will be live at: $FRONTEND_URL"
+echo "    3. After CI completes, your demo will be live at:"
+echo "         React   : $FRONTEND_URL"
+echo "         Angular : $ANGULAR_URL"
 echo ""
 echo "  To tear down all resources after the demo:"
 echo "    ./teardown-stack.sh $ENV_NAME $AWS_REGION"

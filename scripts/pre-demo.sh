@@ -4,12 +4,12 @@
 #
 # Run this ~30 minutes before your demo. It will:
 #   1. Deploy all 3 CloudFormation stacks (infra)
-#   2. Optionally set the STACK_NAME GitHub variable in both repos
+#   2. Optionally set the STACK_NAME GitHub variable in all repos
 #   3. Optionally trigger GitHub Actions CI/CD workflows
 #   4. Print the live demo URLs
 #
 # Usage:
-#   ./pre-demo.sh [env-name] [aws-region] [backend-repo] [frontend-repo]
+#   ./pre-demo.sh [env-name] [aws-region] [backend-repo] [frontend-repo] [angular-repo]
 #
 # Examples:
 #   # Deploy infra only (trigger CI manually afterward):
@@ -17,7 +17,7 @@
 #
 #   # Full automation (requires gh CLI + auth):
 #   ./pre-demo.sh ecommerce-demo ap-southeast-2 \
-#     myorg/ecommerce-backend myorg/react-ecommerce-app
+#     myorg/ecommerce-backend myorg/react-ecommerce-app myorg/angular-ecommerce-app
 #
 # Prerequisites:
 #   - AWS CLI v2  : installed and configured (aws configure)
@@ -30,6 +30,7 @@ ENV_NAME="${1:-ecommerce-demo}"
 AWS_REGION="${2:-ap-southeast-2}"
 BACKEND_REPO="${3:-}"
 FRONTEND_REPO="${4:-}"
+ANGULAR_REPO="${5:-}"
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -63,6 +64,7 @@ echo "  Environment   : $ENV_NAME"
 echo "  Region        : $AWS_REGION"
 echo "  Backend repo  : ${BACKEND_REPO:-'(not specified — CI must be triggered manually)'}"
 echo "  Frontend repo : ${FRONTEND_REPO:-'(not specified — CI must be triggered manually)'}"
+echo "  Angular repo  : ${ANGULAR_REPO:-'(not specified — CI must be triggered manually)'}"
 echo "  Started at    : $(date)"
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -83,22 +85,28 @@ header "STEP 2/3 — Reading Stack Outputs"
 COMPUTE_STACK="${ENV_NAME}-compute"
 
 FRONTEND_URL=$(get_cf_output "FrontendALBUrl"            "$COMPUTE_STACK")
+ANGULAR_URL=$(get_cf_output  "AngularALBUrl"             "$COMPUTE_STACK")
 BACKEND_URL=$(get_cf_output  "BackendALBUrl"             "$COMPUTE_STACK")
 BACKEND_DNS=$(get_cf_output  "BackendALBDNS"             "$COMPUTE_STACK")
 ECS_CLUSTER=$(get_cf_output  "ECSClusterName"            "$COMPUTE_STACK")
 BACKEND_SVC=$(get_cf_output  "BackendServiceName"        "$COMPUTE_STACK")
 FRONTEND_SVC=$(get_cf_output "FrontendServiceName"       "$COMPUTE_STACK")
+ANGULAR_SVC=$(get_cf_output  "AngularServiceName"        "$COMPUTE_STACK")
 BACKEND_ECR=$(get_cf_output  "BackendECRRepositoryUri"   "$COMPUTE_STACK")
 FRONTEND_ECR=$(get_cf_output "FrontendECRRepositoryUri"  "$COMPUTE_STACK")
+ANGULAR_ECR=$(get_cf_output  "AngularECRRepositoryUri"   "$COMPUTE_STACK")
 
 echo "  Frontend URL    : $FRONTEND_URL"
+echo "  Angular URL     : $ANGULAR_URL"
 echo "  Backend URL     : $BACKEND_URL"
 echo "  Backend ALB DNS : $BACKEND_DNS"
 echo "  ECS Cluster     : $ECS_CLUSTER"
 echo "  Backend service : $BACKEND_SVC"
 echo "  Frontend service: $FRONTEND_SVC"
+echo "  Angular service : $ANGULAR_SVC"
 echo "  Backend ECR     : $BACKEND_ECR"
 echo "  Frontend ECR    : $FRONTEND_ECR"
+echo "  Angular ECR     : $ANGULAR_ECR"
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # STEP 3 — Trigger CI/CD pipelines
@@ -111,7 +119,7 @@ if ! command -v gh &>/dev/null; then
   echo ""
   echo "  ACTION REQUIRED — follow these steps before your demo:"
   echo ""
-  echo "  ① Set the STACK_NAME variable in BOTH GitHub repos:"
+  echo "  ① Set the STACK_NAME variable in ALL GitHub repos:"
   echo "       Name  : STACK_NAME"
   echo "       Value : $ENV_NAME"
   echo ""
@@ -120,6 +128,9 @@ if ! command -v gh &>/dev/null; then
   fi
   if [ -n "$FRONTEND_REPO" ]; then
     echo "     Frontend: https://github.com/${FRONTEND_REPO}/settings/variables/actions"
+  fi
+  if [ -n "$ANGULAR_REPO" ]; then
+    echo "     Angular:  https://github.com/${ANGULAR_REPO}/settings/variables/actions"
   fi
   echo ""
   echo "  ② Trigger the 'deploy' workflow in each repo (push to main, or"
@@ -131,12 +142,15 @@ if ! command -v gh &>/dev/null; then
   if [ -n "$FRONTEND_REPO" ]; then
     echo "     Frontend Actions: https://github.com/${FRONTEND_REPO}/actions"
   fi
+  if [ -n "$ANGULAR_REPO" ]; then
+    echo "     Angular Actions:  https://github.com/${ANGULAR_REPO}/actions"
+  fi
   echo ""
-  echo "  ③ Wait for both workflows to succeed (~8-10 min total)."
+  echo "  ③ Wait for all workflows to succeed (~8-10 min total)."
 
 else
   # ── gh CLI available: automate variable setting and workflow dispatch ───────
-  for REPO_ENTRY in "backend:$BACKEND_REPO" "frontend:$FRONTEND_REPO"; do
+  for REPO_ENTRY in "backend:$BACKEND_REPO" "frontend:$FRONTEND_REPO" "angular:$ANGULAR_REPO"; do
     ROLE="${REPO_ENTRY%%:*}"
     REPO="${REPO_ENTRY##*:}"
     [ -z "$REPO" ] && continue
@@ -158,27 +172,40 @@ else
   done
 
   # ── Wait for pipelines to complete ─────────────────────────────────────────
-  if [ -n "$BACKEND_REPO" ] && [ -n "$FRONTEND_REPO" ]; then
+  if [ -n "$BACKEND_REPO" ] || [ -n "$FRONTEND_REPO" ] || [ -n "$ANGULAR_REPO" ]; then
     echo ""
     step "Waiting for CI pipelines to complete..."
-    echo "  Backend pipeline  (~5-8 min): $BACKEND_REPO"
-    echo "  Frontend pipeline (~3-5 min): $FRONTEND_REPO"
+    [ -n "$BACKEND_REPO"  ] && echo "  Backend pipeline  (~5-8 min): $BACKEND_REPO"
+    [ -n "$FRONTEND_REPO" ] && echo "  Frontend pipeline (~3-5 min): $FRONTEND_REPO"
+    [ -n "$ANGULAR_REPO"  ] && echo "  Angular pipeline  (~3-5 min): $ANGULAR_REPO"
     echo "  (Total estimated: ~8-10 minutes)"
     echo ""
 
     # Small delay to let GitHub register the triggered runs
     sleep 15
 
-    echo "  Monitoring backend deployment..."
-    gh run watch --exit-status --repo "$BACKEND_REPO" \
-      && ok "Backend deployment succeeded" \
-      || warn "Backend run check failed — verify at: https://github.com/${BACKEND_REPO}/actions"
+    if [ -n "$BACKEND_REPO" ]; then
+      echo "  Monitoring backend deployment..."
+      gh run watch --exit-status --repo "$BACKEND_REPO" \
+        && ok "Backend deployment succeeded" \
+        || warn "Backend run check failed — verify at: https://github.com/${BACKEND_REPO}/actions"
+      echo ""
+    fi
 
-    echo ""
-    echo "  Monitoring frontend deployment..."
-    gh run watch --exit-status --repo "$FRONTEND_REPO" \
-      && ok "Frontend deployment succeeded" \
-      || warn "Frontend run check failed — verify at: https://github.com/${FRONTEND_REPO}/actions"
+    if [ -n "$FRONTEND_REPO" ]; then
+      echo "  Monitoring frontend deployment..."
+      gh run watch --exit-status --repo "$FRONTEND_REPO" \
+        && ok "Frontend deployment succeeded" \
+        || warn "Frontend run check failed — verify at: https://github.com/${FRONTEND_REPO}/actions"
+      echo ""
+    fi
+
+    if [ -n "$ANGULAR_REPO" ]; then
+      echo "  Monitoring Angular deployment..."
+      gh run watch --exit-status --repo "$ANGULAR_REPO" \
+        && ok "Angular deployment succeeded" \
+        || warn "Angular run check failed — verify at: https://github.com/${ANGULAR_REPO}/actions"
+    fi
   fi
 fi
 
@@ -190,8 +217,9 @@ echo -e "${GREEN}╔════════════════════
 echo -e "${GREEN}║              Demo Infrastructure Ready!          ║${NC}"
 echo -e "${GREEN}╚══════════════════════════════════════════════════╝${NC}"
 echo ""
-echo "  🌐 Demo URL (share with attendees):"
-echo "       $FRONTEND_URL"
+echo "  🌐 Demo URLs (share with attendees):"
+echo "       React   : $FRONTEND_URL"
+echo "       Angular : $ANGULAR_URL"
 echo ""
 echo "  🔧 Backend API:"
 echo "       $BACKEND_URL"

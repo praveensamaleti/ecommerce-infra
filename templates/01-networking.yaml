@@ -298,6 +298,24 @@ Resources:
         - Key: Name
           Value: !Sub '${EnvironmentName}-frontend-ecs-sg'
 
+  # Angular ECS: Nginx on port 80, reachable only from ALB (mirrors FrontendECSSecurityGroup)
+  AngularECSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub '${EnvironmentName}-angular-ecs-sg'
+      GroupDescription: Angular Nginx ECS containers - inbound port 80 from ALB only
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - Description: Nginx from ALB
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+      # Egress: all -- Fargate needs ECR image pull (443)
+      Tags:
+        - Key: Name
+          Value: !Sub '${EnvironmentName}-angular-ecs-sg'
+
   # RDS PostgreSQL: port 5432 accessible ONLY from backend ECS tasks
   RDSSecurityGroup:
     Type: AWS::EC2::SecurityGroup
@@ -351,6 +369,14 @@ Resources:
     UpdateReplacePolicy: Delete
     Properties:
       LogGroupName: !Sub '/ecs/${EnvironmentName}-frontend'
+      RetentionInDays: 1
+
+  AngularLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub '/ecs/${EnvironmentName}-angular'
       RetentionInDays: 1
 
   # --------------------------------------------------------------------------
@@ -417,8 +443,10 @@ Resources:
                 Resource:
                   - !GetAtt BackendLogGroup.Arn
                   - !GetAtt FrontendLogGroup.Arn
+                  - !GetAtt AngularLogGroup.Arn
                   - !Sub '${BackendLogGroup.Arn}:*'
                   - !Sub '${FrontendLogGroup.Arn}:*'
+                  - !Sub '${AngularLogGroup.Arn}:*'
       Tags:
         - Key: Name
           Value: !Sub '${EnvironmentName}-ecs-task-role'
@@ -529,3 +557,15 @@ Outputs:
     Value: !Ref FrontendLogGroup
     Export:
       Name: !Sub '${EnvironmentName}:FrontendLogGroupName'
+
+  AngularECSSecurityGroupId:
+    Description: Security group ID for Angular ECS containers
+    Value: !Ref AngularECSSecurityGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularECSSecurityGroupId'
+
+  AngularLogGroupName:
+    Description: CloudWatch log group for Angular ECS tasks
+    Value: !Ref AngularLogGroup
+    Export:
+      Name: !Sub '${EnvironmentName}:AngularLogGroupName'

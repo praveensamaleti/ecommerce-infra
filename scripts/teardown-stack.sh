@@ -6,9 +6,9 @@
 # Example: ./teardown-stack.sh ecommerce-demo ap-southeast-2
 #
 # Stacks deleted (in reverse order):
-#   1. {env}-compute     (ECS services, ALBs, task definitions)
-#   2. {env}-data        (ECR images, RDS DB, ElastiCache, Secrets Manager)
-#   3. {env}-networking  (VPC, subnets, security groups, IAM roles)
+#   1. {env}-compute     (ECS services — backend, React, Angular — ALBs, task definitions)
+#   2. {env}-data        (ECR repos — backend, React, Angular — RDS DB, ElastiCache, Secrets)
+#   3. {env}-networking  (VPC, subnets, security groups incl. Angular, IAM roles)
 #
 # What happens to data:
 #   - RDS: deleted with an auto-named final snapshot (AWS now blocks SkipFinalSnapshot=true
@@ -64,7 +64,7 @@ echo "  Started at : $(date)"
 step "Pre-teardown: scaling ECS services down to 0"
 ECS_CLUSTER="${ENV_NAME}-cluster"
 
-for SVC in "${ENV_NAME}-backend-service" "${ENV_NAME}-frontend-service"; do
+for SVC in "${ENV_NAME}-backend-service" "${ENV_NAME}-frontend-service" "${ENV_NAME}-angular-service"; do
   aws ecs update-service \
     --cluster  "$ECS_CLUSTER" \
     --service  "$SVC" \
