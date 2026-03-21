@@ -1,0 +1,100 @@
+version: '3.8'
+
+# Local development stack:
+#   http://localhost:3000  → React frontend (nginx, proxies /api to backend)
+#   http://localhost:8080  → Spring Boot backend (direct access / Swagger UI)
+#   localhost:5432         → PostgreSQL
+#   localhost:6379         → Redis
+#
+# Usage:
+#   docker compose up --build        # first run (builds images)
+#   docker compose up                # subsequent runs
+#   docker compose down -v           # stop and remove volumes (wipes DB data)
+
+services:
+
+  # ─── Infrastructure ───────────────────────────────────────────────────────
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: ecommerce-postgres
+    environment:
+      POSTGRES_DB: ecommerce
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d ecommerce"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: ecommerce-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ─── Backend ──────────────────────────────────────────────────────────────
+
+  backend:
+    build:
+      context: ../ecommerce-backend
+    container_name: ecommerce-backend
+    ports:
+      - "8080:8080"
+    environment:
+      # PostgreSQL — points to the local postgres container
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ecommerce
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      # Redis — local container, no SSL (AWS ElastiCache uses SSL; local does not)
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      REDIS_SSL: "false"
+      # JWT — local dev secret (change in production via proper secret management)
+      JWT_SECRET: localDevSecretKeyForJWTGenerationThatIsLongEnoughToBeSecure123456
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    # Retry on failure in case Spring Boot starts before DB is fully ready
+    restart: on-failure
+
+  # ─── Frontend ─────────────────────────────────────────────────────────────
+
+  frontend:
+    build:
+      context: ../react-ecommerce-app
+      args:
+        # Baked into the JS bundle at build time.
+        # All /api/* calls go to http://localhost:3000/api/* which nginx
+        # proxies to the backend container — no CORS issues.
+        REACT_APP_API_URL: http://localhost:3000
+    container_name: ecommerce-frontend
+    ports:
+      - "3000:80"
+    volumes:
+      # Mount the local-dev nginx config (proxy enabled) over the default one
+      - ../react-ecommerce-app/nginx.local.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - backend
+
+# ─── Volumes ────────────────────────────────────────────────────────────────
+
+volumes:
+  postgres_data:
+    # Named volume so DB data survives container restarts.
+    # Run `docker compose down -v` to wipe it.
